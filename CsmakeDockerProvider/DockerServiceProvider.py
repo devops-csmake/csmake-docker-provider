@@ -28,18 +28,46 @@ class DockerServiceDaemon(CsmakeServiceDaemon):
         self.process = None
         self.oldhost = None
         self.host = None
+        self.bindMounts = []
+
+    def _umountBinds(self):
+        for real, bind in self.bindMounts:
+            try:
+                subprocess.call(['sudo', 'umount', '-l', bind])
+            except:
+                self.log.info("umount docker short exec path failed: %s", bind)
+            try:
+                subprocess.call(['sudo', 'rmdir', '-p', bind])
+            except:
+                self.log.info("rmdir docker short exec path failed: %s", bind)
 
     def _startListening(self):
+        tag = self.provider.tag
         fulldockerd = subprocess.check_output(
             ['which', 'dockerd'] )
         prefix = ''
         if self.options['chroot'] is not None:
-            prefix = self.options['chroot'] + '/'
+            prefix = os.path.abspath(self.options['chroot'] + '/')
+
+        #Setup all the paths.
+        realExecPath = prefix + self.options['exec-root']
+        #Is the length of the socket path to container socket
+        # greater than 91 (Minimum known max path length for unix socket)
+        if len(realExecPath) + len('/libcontainerd/docker-containerd.sock') > 91:
+            #Yup, we have to do a bind mount.
+            bindExecPath = os.path.join(
+                os.path.expanduser('~'),
+                '.cs-docker',
+                tag )
+            self.bindMounts.append((realExecPath, bindExecPath))
+        else:
+            bindExecPath = realExecPath
+
         #Is the host a remote or local?
         if not self.options['host'].startswith('unix://'):
             portAddress = self.options['port'].address()
             hostaddress = 'tcp://%s:%d' % portAddress
-            self.host = address
+            self.host = hostaddress
             self.local = False
         else:
             hostaddress = 'unix://%s%s' % (prefix, self.options['host'][7:])
@@ -51,12 +79,23 @@ class DockerServiceDaemon(CsmakeServiceDaemon):
         if 'bridge' in self.options:
             bridge = ['--bridge', self.options['bridge']]
 
+        subprocess.check_call(['sudo', 'mkdir', '-p', os.path.join(
+            realExecPath, "libcontainerd")])
+        subprocess.check_call(['sudo', 'mkdir', '-p', prefix + self.options['graph']])
+        subprocess.check_call(['sudo', 'mkdir', '-p', bindExecPath])
+        try:
+            for real, bind in self.bindMounts:
+                subprocess.check_call(['sudo', 'mount', '--bind', real, bind])
+        except:
+            self._umountBinds()
+
         command = [
-          'sudo', fulldockerd.strip() ] + bridge + [
-          '--exec-root', prefix + self.options['exec-root'],
+          'sudo', fulldockerd.strip() ] + bridge + [ '--debug',
+          '--exec-root', bindExecPath,
           '--graph', prefix + self.options['graph'],
           '--host', hostaddress,
-          '--pidfile', prefix + self.options['pidfile']
+          '--pidfile', prefix + self.options['pidfile'],
+          '--storage-driver', self.options['storage-driver']
         ]
         self.log.debug("Calling Popen with: %s", ' '.join(command))
         port = self.options['port']
@@ -67,27 +106,41 @@ class DockerServiceDaemon(CsmakeServiceDaemon):
             #The process is running outside the chroot and
             #  will poke into the chroot
             self.process = subprocess.Popen(
-                command )
+                command, stdout=self.log.out(), stderr=self.log.err() )
+            self.log.debug("Popen finished")
+            self.log.out()
             if self.process.poll() is not None:
                 raise Exception("Process is not running")
             if 'DOCKER_HOST' in os.environ:
                 self.oldhost = os.environ['DOCKER_HOST']
             os.environ['DOCKER_HOST'] = self.host
+            self.log.debug("DOCKER_HOST set")
+            self.log.out()
             address = port.address()
             #Wait for 5 seconds to see the process come about
             for x in range(0,50):
                 try:
+                    self.log.debug("Testing dockerd openness")
+                    self.log.out()
                     subprocess.check_call(
-                        ['docker', '-H', hostaddress, 'info'] )
+                        ['docker', '-H', hostaddress, 'info'],
+                        stdout=self.log.out(),
+                        stderr=self.log.err() )
                     #Process is listening - probably
                     if self.process.poll() is not None:
                         raise Exception("Process is not running")
                     break
                 except:
                     #Process is not listening yet wait .1 sec and try again
+                    self.log.debug("Not ready yet")
+                    self.log.out()
                     time.sleep(.1)
+                    self.log.debug("Polling again")
+                    self.log.out()
                     if self.process.poll() is not None:
                         raise Exception("Process is not running")
+                    self.log.debug("Poll completed")
+                    self.log.out()
             else:
                 if self.process.poll() is not None:
                     raise Exception("Process never started")
@@ -104,32 +157,37 @@ class DockerServiceDaemon(CsmakeServiceDaemon):
                 processes = self.configManager.shellout(
                     subprocess.check_output,
                     [ 'ps', '-o', 'pid', '--ppid', str(self.process.pid), '--noheaders' ] )
-                processes = processes.split()
-                for process in processes:
-                    self.configManager.shellout(
-                        subprocess.call,
-                        [ 'kill', '-9', process ] )
-            except:
-                self.log.exception("Could not stop dockerd using standard procedure, attempting to use sudo calls exclusively")
-                if self.process is None:
-                    raise Exception("dockerd service never started")
-                subprocess.call("""set -eux
-                    for x in `sudo ps -o pid --ppid %d --noheaders`
-                    do
-                        sudo kill -9 $x
-                    done
-                    """ % self.process.pid,
-                    shell=True,
+                process = processes.split()[0] #There must only be one here
+                subprocess.call(
+                    [ 'sudo', 'kill', '-SIGTERM', process ],
                     stdout=self.log.out(),
                     stderr=self.log.err() )
-                subprocess.call(
-                    ['sudo', 'kill', str(self.process.pid)],
-                    stdout=self.log.out(),
-                    stderr=self.log.err())
-        except:
-            self.log.exception("Couldn't terminate process cleanly")
+                
+                try:
+                    for x in range(55):
+                        subprocess.check_call(
+                            [ 'ps', '-q', process, '--noheaders' ],
+                            stdout=self.log.out(),
+                            stderr=self.log.err() )
+                        time.sleep(0.1)
+                    subprocess.call(
+                        ['sudo', 'kill', '-SIGKILL', process ],
+                        stdout=self.log.out(),
+                        stderr=self.log.err())
+                    for x in range(25):
+                        subprocess.check_call(
+                            [ 'ps', '-q', process, '--noheaders' ],
+                            stdout=self.log.out(),
+                            stderr=self.log.err() )
+                        time.sleep(0.1)
+                    self.log.error("Could not terminate docker process: %d", self.process.pid)
+                except:
+                    self.log.info("Docker process terminated successfully")
+            except:
+                self.log.exception("Couldn't terminate process cleanly")
 
         finally:
+            self._umountBinds()
             if self.oldhost is not None:
                 os.environ['DOCKER_HOST'] = self.oldhost
             elif 'DOCKER_HOST' in os.environ:
@@ -157,3 +215,6 @@ class DockerServiceProvider(CsmakeServiceProvider):
             self.options['host'] = host
         if 'pidfile' not in self.options:
             self.options['pidfile'] = pid
+        if 'storage-driver' not in self.options:
+            self.options['storage-driver'] = 'devicemapper'
+

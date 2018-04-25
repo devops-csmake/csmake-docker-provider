@@ -72,6 +72,9 @@ class DockerService(CsmakeAspect):
                   Default: unix://chroot + /var/run/docker.sock
          pidfile - (OPTIONAL) The location for dockerd to put the pidfile
                   Default: chroot + /var/run/docker.pid
+         storage-driver - (OPTIONAL) The storage driver to use:
+                           e.g., devicemapper, aufs, etc...
+                  Default: devicemapper
          interfaces - (OPTIONAL) List of interfaces to listen on,
                         delimited with commas or newlines.
                         When "host" doesn't start with unix://
